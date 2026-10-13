@@ -1,0 +1,268 @@
+import logging
+import numpy as np
+import matplotlib.pyplot as plt
+import cobra
+from scipy.optimize import brentq
+
+logging.getLogger("cobra").setLevel(logging.ERROR)
+
+# =====================================================================
+# PARAMETERS
+# =====================================================================
+MODEL_FILE = "pedio_ready2.xml"     
+DT, T_END, V = 0.25, 48.0, 1.0            # h, h, L 
+
+GLC0 = 10.0                               # g/L glucose at 0 h 
+GLC_FEED_RATE = 12.0 / 24.0               # g/L/h continuous feed
+T_FEED0 = 24.0                            # from 24 h to the end
+YE0, Y_YE_GLC = 20.0, 0.7726              # g/L yeast extract; g YE per g glucose
+
+NACL0, NACL_END, T_RAMP0 = 2.0, 10.0, 24.0   # % NaCl, linear ramp from 24 h to the end
+
+PH0 = 6.5
+K2HPO4 = 0.5                              # g/L phosphate buffer
+
+X0 = 0.10                                 # g/L DCW inoculum
+TARGET_DCW = 2.5                          # g/L, reported only
+SOLVE_X0_FOR_TARGET = True                # also solve for the inoculum that gives exactly TARGET_DCW at 48 h
+USE_SOLVED_X0_FOR_PLOT = True             # plot the run with the solved inoculum
+
+MU_MAX = 0.45                             # 1/h, salt-free, 30 C (LIT: Mandal 2016, P. acidilactici NCIM 2292, meat-waste hydrolysate)
+KS_GLC = 1.34                             # g/L (LIT: Mandal 2016)
+KS_YE = 0.77                              # g/L (Mandal 2016 value for the protein substrate, borrowed for yeast extract)
+ATPM0 = 5.0                               # mmol ATP/gDW/h without salt
+ATPM_SALT = 1.5                           # extra ATPM per % NaCl above 2 % 
+AA_MW = 0.12                              # g/mmol, mean mass of the yeast-extract compounds taken up
+SALT_S50, SALT_N = 8.0, 3.0               # growth factor 1/(1+(NaCl/S50)^n): 0.98 at 2 %, 0.5 at 8 %, 0.34 at 10
+PH_STOP, PH_FREE = 3.6, 5.0               # growth stops / unaffected 
+G_GLC = 0.18016                           # g/mmol glucose
+MW_ACID = 0.09008                         # g/mmol lactic acid
+
+# =====================================================================
+# pH: charge balance (phosphate + lactate + yeast extract amino acid/peptide groups)
+# =====================================================================
+K1, K2, K3, KL, KW = 10**-2.15, 10**-7.20, 10**-12.35, 10**-3.86, 1e-14
+PT = K2HPO4 / 174.18                      # mol/L phosphate
+
+YE_GROUPS = [   # per g yeast extract
+    dict(mmol_per_g=0.89,  pKa=4.2, kind="acid"),    # Asp/Glu side chains
+    dict(mmol_per_g=0.077, pKa=6.0, kind="base"),    # His imidazole
+    dict(mmol_per_g=0.70,  pKa=7.7, kind="base"),    # peptide N-termini
+    dict(mmol_per_g=0.70,  pKa=3.6, kind="acid"),    # peptide C-termini
+    dict(mmol_per_g=2.34,  pKa=2.2, kind="acid"),    # free amino acid alpha-COOH
+]
+
+def ye_charges(h):
+    neg = pos = 0.0
+    for g in YE_GROUPS:
+        c = g["mmol_per_g"] * YE0 / 1000.0            # mol/L,
+        Ka = 10**-g["pKa"]
+        if g["kind"] == "acid":
+            neg += c * Ka / (h + Ka)
+        else:
+            pos += c * h / (h + Ka)
+    return neg, pos
+
+def phos_neg(h):
+    D = h**3 + K1*h**2 + K1*K2*h + K1*K2*K3
+    return PT * (K1*h**2 + 2*K1*K2*h + 3*K1*K2*K3) / D
+
+def lac_neg(h, L):
+    return L / (1.0 + h / KL)
+
+def base_needed(pH, L):
+    h = 10**-pH
+    yn, yp = ye_charges(h)
+    return phos_neg(h) + lac_neg(h, L) + yn - yp + KW/h - h
+
+B0 = base_needed(PH0, 0.0)
+
+def solve_pH(B, L):
+    def f(pH):
+        h = 10**-pH
+        yn, yp = ye_charges(h)
+        return B + h + yp - phos_neg(h) - lac_neg(h, L) - yn - KW/h
+    return brentq(f, 1.5, 11.0)
+
+# =====================================================================
+# FBA, anaerobic
+# =====================================================================
+model = cobra.io.read_sbml_model(MODEL_FILE)
+if "EX_o2_e" in model.reactions:
+    model.reactions.EX_o2_e.lower_bound = 0.0
+
+OBJ = [r for r in model.reactions if r.objective_coefficient != 0][0]    # biomass reaction taken from the model itself
+LAC = model.reactions.EX_lac__L_e
+
+NUT_EX = ["EX_adn_e","EX_ala__L_e","EX_amp_e","EX_arg__L_e","EX_asp__L_e","EX_cys__L_e",
+          "EX_dad_2_e","EX_dcyt_e","EX_fol_e","EX_glu__L_e","EX_gly_e","EX_gmp_e","EX_his__L_e",
+          "EX_hxan_e","EX_ile__L_e","EX_ins_e","EX_leu__L_e","EX_lipoate_e","EX_lys__L_e",
+          "EX_met__L_e","EX_nac_e","EX_phe__L_e","EX_pheme_e","EX_pnto__R_e","EX_pro__L_e",
+          "EX_ribflv_e","EX_ser__L_e","EX_thm_e","EX_thr__L_e","EX_thymd_e","EX_trp__L_e",
+          "EX_tyr__L_e","EX_ura_e","EX_uri_e","EX_val__L_e"]
+NUT_EX = [e for e in NUT_EX if e in model.reactions]
+print(f"Biomass reaction: {OBJ.id} | nutrient exchanges found: {len(NUT_EX)}")
+
+NUT_PER_GLC = G_GLC * Y_YE_GLC / (max(1, len(NUT_EX)) * AA_MW)     # mmol per exchange per mmol glucose
+
+def solve_growth(q, nut, atpm):
+    """Growth (1/h) and acid secretion (mmol/gDW/h) at glucose uptake q, yeast-extract availability nut (0-1)
+    and maintenance atpm. If the cell cannot even pay maintenance, growth is zero and all glucose goes to acid.
+    Otherwise growth is held at >= 95% of maximum while lactate is maximised."""
+    with model:
+        model.reactions.EX_glc__D_e.lower_bound = -q
+        model.reactions.ATPM.lower_bound = atpm
+        for e in NUT_EX:
+            model.reactions.get_by_id(e).lower_bound = -NUT_PER_GLC * q * nut
+        mu = model.slim_optimize(error_value=float("nan"))
+        if not (mu == mu) or mu < 1e-9:
+            model.reactions.ATPM.lower_bound = 0.0          # starving: no growth, glucose still fermented
+            OBJ.upper_bound = 0.0
+            model.objective = LAC
+            sol = model.optimize()
+            if sol.status != "optimal":
+                return 0.0, 0.0
+            return 0.0, max(0.0, sol.objective_value)
+        OBJ.lower_bound = 0.95 * mu
+        model.objective = LAC
+        sol = model.optimize()
+        if sol.status != "optimal":
+            return 0.0, 0.0
+        ac = max(0.0, sol.fluxes.get("EX_ac_e", 0.0))
+        return sol.fluxes[OBJ.id], sol.fluxes[LAC.id] + ac
+
+_cache = {}
+def fba(q, nut, atpm):
+    key = (float(f"{q:.3g}"), round(nut, 1), round(atpm, 1))     # 3 significant figures on q
+    if key not in _cache:
+        _cache[key] = solve_growth(*key) if key[0] > 0.01 else (0.0, 0.0)
+    return _cache[key]
+
+def atpm_of(nacl):
+    return ATPM0 + ATPM_SALT * max(0.0, nacl - NACL0)
+
+def salt_factor(nacl):
+    return 1.0 / (1.0 + (nacl / SALT_S50) ** SALT_N)
+
+# Uptake cap such that FBA growth at saturating glucose, salt-free, equals the literature mu_max
+def _f(q):
+    return solve_growth(q, 1.0, ATPM0)[0] - MU_MAX
+_hi = 80.0
+if _f(_hi) < 0:
+    raise SystemExit(f"FBA cannot reach mu={MU_MAX} even at {_hi} mmol/gDW/h glucose: "
+                     f"max {solve_growth(_hi, 1.0, ATPM0)[0]:.3f}. Check the nutrient exchanges / model file.")
+QMAX = brentq(_f, 1.0, _hi)
+mu_chk, ac_chk = solve_growth(QMAX, 1.0, ATPM0)
+print(f"Calibrated glucose uptake cap: {QMAX:.2f} mmol/gDW/h -> mu={mu_chk:.3f} 1/h, "
+      f"acid/glucose={ac_chk/QMAX:.2f} mol/mol ({ac_chk/QMAX*MW_ACID/G_GLC:.2f} g/g), "
+      f"biomass yield={mu_chk/(QMAX*G_GLC):.3f} g/g glucose")
+with model:
+    model.reactions.EX_glc__D_e.lower_bound = 0
+    model.reactions.ATPM.lower_bound = 0
+    for e in NUT_EX:
+        model.reactions.get_by_id(e).lower_bound = -NUT_PER_GLC * QMAX
+    print("No glucose, same yeast-extract supply as at QMAX (want ~0):", model.slim_optimize(error_value=float("nan")))
+
+h_hi, h_lo = 10**-PH0, 10**-PH_STOP
+yn1, yp1 = ye_charges(h_hi); yn2, yp2 = ye_charges(h_lo)
+print(f"Buffering from pH {PH0} to {PH_STOP}: yeast extract {((yn1 - yp1) - (yn2 - yp2)) * 1000:.0f} mM H+, "
+      f"phosphate {(phos_neg(h_hi) - phos_neg(h_lo)) * 1000:.0f} mM H+")
+
+# =====================================================================
+# SIMULATION
+# =====================================================================
+def nacl_at(t):
+    return NACL0 + (NACL_END - NACL0) * min(1.0, max(0.0, (t - T_RAMP0) / (T_END - T_RAMP0)))
+
+def run(x0, record=False, setpoint=PH_SETPOINT):
+    x, glc, ye, acid_mM, B = x0, GLC0, YE0, 0.0, B0
+    base_mmol = 0.0
+    H = dict(t=[], xh=[], gh=[], yh=[], ph=[], nacl=[], ah=[])
+    pH_min = PH0
+    for step in range(int(round(T_END / DT)) + 1):
+        t = step * DT
+        nacl = nacl_at(t)
+        if T_FEED0 <= t < T_END:
+            glc += GLC_FEED_RATE * DT
+
+        pH = solve_pH(B, acid_mM / 1000.0)
+        if setpoint is not None and pH < setpoint:
+            need = base_needed(setpoint, acid_mM / 1000.0)
+            base_mmol += max(0.0, need - B) * 1000.0 * V
+            B = max(B, need); pH = setpoint
+        pH_min = min(pH_min, pH)
+
+        if record:
+            for k, v in zip(H, (t, x, glc, ye, pH, nacl, acid_mM * MW_ACID)):
+                H[k].append(v)
+        if step == int(round(T_END / DT)):
+            break
+
+        kin_glc = glc / (glc + KS_GLC) if glc > 0.02 else 0.0
+        kin_ye  = ye / (ye + KS_YE) if ye > 0.01 else 0.0
+        ph_f    = 1.0 if pH > PH_FREE else max(0.0, (pH - PH_STOP) / (PH_FREE - PH_STOP))
+        q = QMAX * kin_glc * ph_f * salt_factor(nacl)           # mmol glucose/gDW/h
+        mu, acid_flux = fba(q, kin_ye, atpm_of(nacl))
+
+        glc_use = min(glc, q * x * G_GLC * DT)                  # g/L glucose consumed this step
+        scale = glc_use / (q * x * G_GLC * DT) if q * x > 0 else 0.0
+        x += mu * x * DT * scale
+        acid_mM += acid_flux * x * DT * scale
+        glc -= glc_use
+        ye = max(0.0, ye - glc_use * Y_YE_GLC)
+    return dict(x=x, glc=glc, ye=ye, acid=acid_mM * MW_ACID, base=base_mmol, pH=pH, pH_min=pH_min, **H)
+
+# =====================================================================
+# RUNS + REPORT
+# =====================================================================
+fin = run(X0, record=True)
+glc_in = GLC0 + GLC_FEED_RATE * (T_END - T_FEED0)
+used = glc_in - fin["glc"]
+print(f"\nInoculum X0 = {X0} g/L DCW (recipe)")
+print(f"Summary at {T_END:.0f} h (1 L, glucose supplied {glc_in:.1f} g/L):")
+print(f"  DCW = {fin['x']:.2f} g/L | glucose left = {fin['glc']:.1f} g/L | yeast extract left = {fin['ye']:.1f} g/L")
+print(f"  acid = {fin['acid']:.1f} g/L | final pH = {fin['pH']:.2f} | base added = {fin['base']:.0f} mmol")
+print(f"  yield = {(fin['x'] - X0) / max(1e-9, used):.3f} g DCW/g glucose used")
+print(f"  target {TARGET_DCW} g/L: {'MET' if fin['x'] >= TARGET_DCW else 'NOT MET'}")
+
+if PH_SETPOINT is not None:
+    nc = run(X0, setpoint=None)
+    print(f"For comparison, NO pH control at X0 = {X0} g/L: DCW {nc['x']:.2f} g/L, glucose left {nc['glc']:.1f} g/L, "
+          f"yeast extract left {nc['ye']:.1f} g/L, acid {nc['acid']:.1f} g/L, final pH {nc['pH']:.2f}")
+
+x0_solved = None
+if SOLVE_X0_FOR_TARGET:
+    if fin["x"] >= TARGET_DCW:
+        print(f"Target already met with the recipe inoculum ({X0} g/L): no increase needed.")
+    else:
+        try:
+            x0_solved = brentq(lambda a: run(a)["x"] - TARGET_DCW, X0, TARGET_DCW, xtol=1e-3)
+            print(f"Inoculum needed for {TARGET_DCW} g/L at {T_END:.0f} h: {x0_solved:.2f} g/L DCW")
+        except ValueError:
+            print(f"No inoculum up to {TARGET_DCW} g/L reaches {TARGET_DCW} g/L: the limit is the glucose "
+                  f"supply or the acid/pH (final pH {fin['pH']:.2f}), not the inoculum.")
+if USE_SOLVED_X0_FOR_PLOT and x0_solved is not None:
+    fin = run(x0_solved, record=True)
+    print(f"Plotted run: X0 = {x0_solved:.2f} g/L -> DCW {fin['x']:.2f} g/L, final pH {fin['pH']:.2f}, "
+          f"glucose left {fin['glc']:.1f} g/L, yeast extract left {fin['ye']:.1f} g/L")
+
+# =====================================================================
+# PLOTS
+# =====================================================================
+fig, ax1 = plt.subplots(figsize=(9, 5))
+
+ax1.plot(fin["t"], fin["xh"], color="purple", lw=2.5, label="P. acidilactici DCW")
+ax1.set_xlabel("Time (h)"); ax1.set_ylabel("Biomass (g/L DCW)", color="purple")
+ax1.set_xlim(0, T_END); ax1.set_ylim(0, 1.15 * max(fin["xh"]))
+ax1.grid(True, ls=":", alpha=0.5)
+ax1b = ax1.twinx()
+ax1b.plot(fin["t"], fin["gh"], color="blue", lw=2.0, ls="--", label="Glucose")
+ax1b.plot(fin["t"], fin["yh"], color="orange", lw=2.0, ls=":", label="Yeast extract")
+ax1b.set_ylabel("Nutrient concentration (g/L)")
+ax1b.set_ylim(0, 1.1 * max(max(fin["gh"]), max(fin["yh"])))
+ax1.axvline(T_FEED0, color="#555555", ls=":", lw=1.2)
+lines = ax1.get_lines()[:1] + ax1b.get_lines()
+ax1.legend(lines, [l.get_label() for l in lines], loc="center right", fontsize=9)
+ax1.set_title(f"P. acidilactici seed reactor (1 L, {T_END:.0f} h)", fontweight="bold")
+
+plt.tight_layout(); plt.savefig("pedio_seed_48h.png", dpi=300, bbox_inches="tight"); plt.show()
