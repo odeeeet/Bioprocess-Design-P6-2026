@@ -1,0 +1,206 @@
+import logging
+import numpy as np
+import matplotlib.pyplot as plt
+import cobra
+from scipy.optimize import brentq
+
+logging.getLogger("cobra").setLevel(logging.ERROR)
+
+# =====================================================================
+# PARAMETERS
+# =====================================================================
+DT, T_END, V = 0.25, 50.0, 1.0           # h, h, L
+GLC0, GLC_FEED, T_FEED = 20.0, 25.0, 14.0
+YE0, Y_YE_GLC = 30.0, 0.6666             # g/L yeast extract; g YE per g glucose
+K2HPO4, PH0 = 20.0, 7.0                  # g/L buffer, starting pH
+X0_FIT = 5.5                             # g/L DCW inoculum
+TARGET_DCW = 10.0
+SEED_CULTURE_DCW = 10.0                  # g/L of the previous stage (only to express X0 as % v/v)
+
+MU_MAX = 0.074      
+KS_GLC, KS_YE = 0.5, 1.0                 # g/L
+XMAX = 11.5                              # g/L crowding cap
+ATPM = 1.0                               # mmol ATP/gDW/h
+NUTR = 2.0                               # nutrient uptake cap at full yeast extract, mmol/gDW/h 
+PH_STOP, PH_FREE = 4.3, 5.5              # growth stops / unaffected 
+G_GLC = 0.18016                          # g/mmol
+
+# =====================================================================
+# pH: charge balance (phosphate + lactate + yeast extract amino acid/peptide groups)
+# =====================================================================
+K1, K2, K3, KL, KW = 10**-2.15, 10**-7.20, 10**-12.35, 10**-3.86, 1e-14
+YE_PHOSPHATE = 0.0     # mmol phosphate per g yeast extract
+PT = K2HPO4 / 174.18 + YE_PHOSPHATE * YE0 / 1000.0
+
+YE_BUFFER = True
+YE_GROUPS = [   # per g yeast extract, ASSUMED from typical composition
+    dict(name="Asp/Glu side chains", mmol_per_g=0.89,  pKa=4.2, kind="acid"),
+    dict(name="His imidazole",       mmol_per_g=0.077, pKa=6.0, kind="base"),
+    dict(name="peptide N-termini",   mmol_per_g=0.70,  pKa=7.7, kind="base"),
+    dict(name="peptide C-termini",   mmol_per_g=0.70,  pKa=3.6, kind="acid"),
+    dict(name="free AA alpha-COOH",  mmol_per_g=2.34,  pKa=2.2, kind="acid"),
+]
+
+def ye_charges(h):
+    neg = pos = 0.0
+    if YE_BUFFER:
+        for g in YE_GROUPS:
+            c = g["mmol_per_g"] * YE0 / 1000.0          # mol/L, held at the initial yeast extract
+            Ka = 10**-g["pKa"]
+            if g["kind"] == "acid":
+                neg += c * Ka / (h + Ka)
+            else:
+                pos += c * h / (h + Ka)
+    return neg, pos
+
+def phos_neg(h):
+    D = h**3 + K1*h**2 + K1*K2*h + K1*K2*K3
+    return PT * (K1*h**2 + 2*K1*K2*h + 3*K1*K2*K3) / D
+
+def lac_neg(h, L):
+    return L / (1.0 + h / KL)
+
+def base_needed(pH, L):
+    h = 10**-pH
+    yn, yp = ye_charges(h)
+    return phos_neg(h) + lac_neg(h, L) + yn - yp + KW/h - h
+
+B0 = base_needed(PH0, 0.0)
+
+def solve_pH(B, L):
+    def f(pH):
+        h = 10**-pH
+        yn, yp = ye_charges(h)
+        return B + h + yp - phos_neg(h) - lac_neg(h, L) - yn - KW/h
+    return brentq(f, 1.5, 11.0)
+
+# =====================================================================
+# FBA (thal_ready.xml: CarveMe model with lactate export), anaerobic
+# =====================================================================
+model = cobra.io.read_sbml_model("thal_ready.xml")
+model.reactions.EX_o2_e.lower_bound = 0.0
+
+NUT_EX = ["EX_adn_e","EX_ala__L_e","EX_amp_e","EX_arg__L_e","EX_asp__L_e","EX_cys__L_e",
+          "EX_dad_2_e","EX_dcyt_e","EX_fol_e","EX_glu__L_e","EX_gly_e","EX_gmp_e","EX_his__L_e",
+          "EX_hxan_e","EX_ile__L_e","EX_ins_e","EX_leu__L_e","EX_lipoate_e","EX_lys__L_e",
+          "EX_met__L_e","EX_nac_e","EX_phe__L_e","EX_pheme_e","EX_pnto__R_e","EX_pro__L_e",
+          "EX_ribflv_e","EX_ser__L_e","EX_thm_e","EX_thr__L_e","EX_thymd_e","EX_trp__L_e",
+          "EX_tyr__L_e","EX_ura_e","EX_uri_e","EX_val__L_e"]
+NUT_EX = [e for e in NUT_EX if e in model.reactions]
+
+def solve_growth(q, nut):
+    """Growth (1/h) and acid secretion (mmol/gDW/h) at glucose uptake q and nutrient availability nut (0-1).
+    Maintenance is capped at 0.5*q so the LP stays feasible at low uptake; growth is held at >= 95% of
+    maximum while lactate is maximised."""
+    with model:
+        model.reactions.EX_glc__D_e.lower_bound = -q
+        model.reactions.ATPM.lower_bound = min(ATPM, 0.5 * q)
+        for e in NUT_EX:
+            model.reactions.get_by_id(e).lower_bound = -NUTR * nut
+        mu = model.slim_optimize(error_value=float("nan"))
+        if not (mu == mu) or mu < 1e-9:
+            return 0.0, 0.0
+        model.reactions.Growth.lower_bound = 0.95 * mu
+        model.objective = model.reactions.EX_lac__L_e
+        sol = model.optimize()
+        if sol.status != "optimal":
+            return 0.0, 0.0
+        ac = max(0.0, sol.fluxes.get("EX_ac_e", 0.0))
+        return sol.fluxes["Growth"], sol.fluxes["EX_lac__L_e"] + ac
+
+_cache = {}
+def fba(q, nut):
+    key = (round(q, 2), round(nut, 1))
+    if key not in _cache:
+        _cache[key] = solve_growth(*key) if key[0] > 1e-3 else (0.0, 0.0)
+    return _cache[key]
+
+# Uptake cap such that FBA growth at saturating glucose equals the literature mu_max
+QMAX = brentq(lambda q: solve_growth(q, 1.0)[0] - MU_MAX, 0.2, 40.0)
+mu_chk, ac_chk = solve_growth(QMAX, 1.0)
+print(f"Calibrated glucose uptake cap: {QMAX:.2f} mmol/gDW/h -> mu={mu_chk:.3f} 1/h, "
+      f"acid/glucose={ac_chk/QMAX:.2f}, biomass yield={mu_chk/(QMAX*G_GLC):.3f} g/g glucose")
+with model:
+    model.reactions.EX_glc__D_e.lower_bound = 0
+    model.reactions.ATPM.lower_bound = 0
+    for e in NUT_EX:
+        model.reactions.get_by_id(e).lower_bound = -NUTR
+    print("No glucose, full nutrients (want ~0):", model.slim_optimize(error_value=float("nan")))
+
+h_hi, h_lo = 10**-PH0, 10**-4.3
+yn1, yp1 = ye_charges(h_hi); yn2, yp2 = ye_charges(h_lo)
+print(f"Buffering from pH {PH0} to 4.3: yeast extract {((yn1 - yp1) - (yn2 - yp2)) * 1000:.0f} mM H+, "
+      f"phosphate {(phos_neg(h_hi) - phos_neg(h_lo)) * 1000:.0f} mM H+")
+
+# =====================================================================
+# SIMULATION
+# =====================================================================
+def run(x0, record=False):
+    x, glc, ye, acid_mM, B = x0, GLC0, YE0, 0.0, B0
+    fed, base_mmol = False, 0.0
+    t_h, x_h, glc_h, ye_h = [], [], [], []
+    pH = PH0
+    for step in range(int(T_END / DT) + 1):
+        t = step * DT
+        if not fed and t >= T_FEED:
+            glc += GLC_FEED; fed = True
+
+        pH = solve_pH(B, acid_mM / 1000.0)
+        if PH_SETPOINT is not None and pH < PH_SETPOINT:
+            need = base_needed(PH_SETPOINT, acid_mM / 1000.0)
+            base_mmol += max(0.0, need - B) * 1000.0 * V
+            B = max(B, need); pH = PH_SETPOINT
+
+        if record:
+            t_h.append(t); x_h.append(x); glc_h.append(glc); ye_h.append(ye)
+        if step == int(T_END / DT):
+            break
+
+        kin_glc = glc / (glc + KS_GLC) if glc > 0.02 else 0.0
+        kin_ye  = ye / (ye + KS_YE) if ye > 0.01 else 0.0
+        ph_f    = 1.0 if pH > PH_FREE else max(0.0, (pH - PH_STOP) / (PH_FREE - PH_STOP))
+        dens_f  = max(0.0, 1.0 - x / XMAX)
+        q = QMAX * kin_glc * ph_f * dens_f                      # mmol glucose/gDW/h
+        mu, acid_flux = fba(q, kin_ye)
+
+        glc_use = min(glc, q * x * G_GLC * DT)                  # g/L glucose consumed this step
+        scale = glc_use / (q * x * G_GLC * DT) if q * x > 0 else 0.0
+        x_new = x + mu * x * DT * scale
+        acid_mM += acid_flux * x * DT * scale
+        glc -= glc_use
+        ye = max(0.0, ye - glc_use * Y_YE_GLC)
+        x = x_new
+    return dict(x=x, glc=glc, ye=ye, acid=acid_mM * 0.09008, base=base_mmol, pH=pH,
+                t=t_h, xh=x_h, gh=glc_h, yh=ye_h)
+
+# =====================================================================
+# FINAL RUN + REPORT
+# =====================================================================
+fin = run(X0_FIT, record=True)
+used = GLC0 + GLC_FEED - fin["glc"]
+print(f"\nInoculum X0 = {X0_FIT} g/L DCW (chosen)")
+print(f"  = {100 * X0_FIT / SEED_CULTURE_DCW:.0f}% v/v of a {SEED_CULTURE_DCW:.0f} g/L seed culture")
+print(f"Summary at {T_END:.0f} h (1 L):")
+print(f"  DCW = {fin['x']:.2f} g/L | glucose left = {fin['glc']:.1f} g/L | yeast extract left = {fin['ye']:.1f} g/L")
+print(f"  acid = {fin['acid']:.1f} g/L | final pH = {fin['pH']:.2f} | base added = {fin['base']:.0f} mmol")
+print(f"  yield = {(fin['x'] - X0_FIT) / max(1e-9, used):.3f} g DCW/g glucose")
+
+# =====================================================================
+# PLOT: biomass (left axis), glucose and yeast extract (right axis)
+# =====================================================================
+fig, ax = plt.subplots(figsize=(9, 5))
+ax.plot(fin["t"], fin["xh"], color="green", lw=2.5, label="T. halophilus DCW")
+ax.set_xlabel("Time (h)"); ax.set_ylabel("Biomass (g/L DCW)", color="green")
+ax.set_xlim(0, T_END); ax.set_ylim(0, 1.1 * max(fin["xh"]))
+ax.grid(True, ls=":", alpha=0.6)
+
+ax2 = ax.twinx()
+ax2.plot(fin["t"], fin["gh"], color="blue", lw=2.0, ls="--", label="Glucose")
+ax2.plot(fin["t"], fin["yh"], color="orange", lw=2.0, ls=":", label="Yeast extract")
+ax2.set_ylabel("Nutrient concentration (g/L)")
+ax2.set_ylim(0, 1.1 * max(max(fin["gh"]), max(fin["yh"])))
+
+lines = ax.get_lines() + ax2.get_lines()
+ax.legend(lines, [l.get_label() for l in lines], loc="center right", fontsize=9)
+ax.set_title("T. halophilus seed reactor (1 L, 48 h)", fontweight="bold")
+plt.tight_layout(); plt.savefig("thal_seed_48h.png", dpi=300, bbox_inches="tight"); plt.show()
