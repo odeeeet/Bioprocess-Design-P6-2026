@@ -7,7 +7,7 @@ from cobra import Reaction, Metabolite
 logging.getLogger("cobra").setLevel(logging.ERROR)
 
 # =====================================================================
-# PARAMETERS (anything marked ASSUMED is a placeholder, not a measurement)
+# PARAMETERS
 # =====================================================================
 DT = 4.0
 SALT_DAY   = 2.0      # salt added after 2-day koji (moromi 10% NaCl)
@@ -24,22 +24,29 @@ WV_STD_SET = {"base": YEAST_DAY}
 
 INOC_THAL  = 0.100    # g/L DCW, T. halophilus (WT and engineered)
 INOC_PEDIO = 0.025    # g/L DCW, P. acidilactici
-INOC_YEAST = 0.015    # g/L DCW, Z. rouxii 
-INOC_WV    = 0.015    # g/L DCW, W. versatilis
+INOC_YEAST = 0.015    # g/L DCW, Z. rouxii
+INOC_WV    = 0.015    # g/L DCW, W. versatilis (same as Z. rouxii)
 
 T_START, T_END = 30.0, 25.0   # 30 C until Z. rouxii, then linear fall to 25 C at the end
 
 G_GLC, G_ACID, G_GSH, G_PED = 0.18016, 0.09008, 0.3073, 4.624   # g/mmol
-Q_THAL, Q_PEDIO = 0.64, 1.5      # glucose uptake caps at 30 C, mmol/gDW/h
-FRAC_PED = {"wt": 4e-6, "mut": 1e-5}   # literature-based: ~2 mg/L WT, ~5 mg/L engineered 
+Q_THAL, Q_PEDIO = 0.64, 1.5      # glucose uptake caps at 30 C, mmol/gDW/h 
+# Pediocin: WT P. acidilactici ATCC 8042 is NOT a pediocin producer, so WT = 0.
+# The engineered strain carries the heterologous pedABCD operon from strain PAC1.0 (plasmid-borne in PAC1.0).
+# 1e-5 mmol pediocin per mmol glucose is ASSUMED to match the ~5 mg/L reported for producer strains in lab media;
+FRAC_PED = {"wt": 0.0, "mut": 1e-5}
+PED_LEADER_ATP = 72     # ATP for the ~18-aa leader peptide that is made and cleaved off
+PED_EXPORT_ATP = 2      # ATP for export by the PedD ABC transporter
 ARG0_mM  = 5.0                   # ASSUMED free arginine
 MW_CITR  = 175.19
 
+# ---- Flavour scenarios (folds are plausibility ranges from the literature, not predictions) ----
+# Literature scale (g/L) and assumed share made by T. halophilus
 TYPICAL = dict(umami=10.0, kokumi=0.10)   # free glutamate ~10 g/L (low end of 8-39); sum of gamma-Glu peptides median ~0.1 g/L (0.02-0.62)
 ATTR    = dict(umami=0.10, kokumi=0.10)   # ASSUMED: share attributable to T. halophilus
 KOKUMI_FOLDS = {"low": 1.3, "base": 3.0, "high": 6.0}   # engineered/WT kokumi, from reported glutathione folds (1.3-6x)
 UMAMI_FOLDS  = {"low": 1.5, "base": 3.0, "high": 3.5}   # engineered/WT umami
-MULT_WT    = dict(umami=0.015, kokumi=0.008, meaty=0.005)  # umami and kokumi are overwritten by the calibration; meaty stays
+MULT_WT    = dict(umami=0.015, kokumi=0.008, meaty=0.005)
 MEATY_FOLD = 2.0     # engineered/WT meaty, matches the ~2x VSC increase reported for CBL overexpression
 
 # W. versatilis growth
@@ -47,7 +54,7 @@ MU_WV, KS_WV, XMAX_WV, DECAY_WV, Y_WV = 0.020, 2.5, 3.0, 0.0002, 0.28
 WV_SALT = 0.7
 WV_PH_STOP, WV_PH_FREE = 3.5, 4.8
 
-# Smoky route: ferulic acid -> 4-VG -> 4-EG by W. versatilis biomass (ASSUMED)
+# Smoky route: ferulic acid -> 4-VG -> 4-EG by W. versatilis biomass
 FA0_mg, K_PAD, K_VPR = 30.0, 0.02, 0.01
 
 T_AMYLASE   = (0.18, 0.09)
@@ -61,7 +68,7 @@ PH_STOP_THAL, PH_STOP_PEDIO = 4.3, 4.2
 PH_FREE = 5.2
 
 PARAMS = {
-    "wt": dict(ph_floor=0.02, p_ph_floor=0.02, ped_Ki=0.002, thal_decay=1.0e-4,
+    "wt": dict(ph_floor=0.02, p_ph_floor=0.02, ped_Ki=0.002, thal_decay=1.0e-4,   # ped_Ki unused for WT 
                p_decay=(0.0045, 0.0085), salt=0.3, adi_k=0.1),
     "mut": dict(ph_floor=0.05, p_ph_floor=0.10, ped_Ki=0.2, thal_decay=5.0e-5,
                 p_decay=(0.0005, 0.0012), salt=0.7, adi_k=0.0),     # arcA knockout
@@ -115,13 +122,15 @@ def build_pedio(frac_ped, adi_ko):
     m = cobra.io.read_sbml_model("pedio_ready2.xml")
     if adi_ko:
         m.reactions.ARGDI_1.bounds = (0.0, 0.0)            # arcA knockout
-    aa = {"lys__L_c": 4, "tyr__L_c": 2, "gly_c": 8, "asn__L_c": 4, "val__L_c": 2, "thr__L_c": 4,
-          "cys__L_c": 4, "his__L_c": 3, "ser__L_c": 2, "asp__L_c": 1, "trp__L_c": 2, "ala__L_c": 4,
-          "ile__L_c": 2, "met__L_c": 1, "gln__L_c": 1}  
-    st = {k: -v for k, v in aa.items()}
-    st.update({"atp_c": -172, "h2o_c": -129, "adp_c": 172, "pi_c": 172, "h_c": 172, "pedioc_c": 1})
-    add_reaction(m, "PEDIOCIN_SYN", st)
-    force_demand(m, "pedioc_c", frac_ped)
+    if frac_ped > 0:                                       # heterologous pedABCD, engineered strain only
+        aa = {"lys__L_c": 4, "tyr__L_c": 2, "gly_c": 8, "asn__L_c": 4, "val__L_c": 2, "thr__L_c": 4,
+              "cys__L_c": 4, "his__L_c": 3, "ser__L_c": 2, "asp__L_c": 1, "trp__L_c": 2, "ala__L_c": 4,
+              "ile__L_c": 2, "met__L_c": 1, "gln__L_c": 1}
+        atp = 172 + PED_LEADER_ATP + PED_EXPORT_ATP
+        st = {k: -v for k, v in aa.items()}
+        st.update({"atp_c": -atp, "h2o_c": -129, "adp_c": atp, "pi_c": atp, "h_c": atp, "pedioc_c": 1})
+        add_reaction(m, "PEDIOCIN_SYN", st)
+        force_demand(m, "pedioc_c", frac_ped)
     return m
 
 _models = {
@@ -252,6 +261,8 @@ def simulate(v, frac_gsh=None, wv_std=None):
         q_p = Q_PEDIO * lerp(T_PEDIO_MU, c) * kin * salt_f * ph_inh_p      if (x2 > 0 and on) else 0.0
         mu_t, glc_t, lac_t, ac_t, gsh_t = fba(tk, q_t)
         mu_p, glc_p, lac_p, ac_p, ped_p = fba(pk, q_p)
+        if v == "mut":
+            mu_p *= (1.0)                                       
 
         # Z. rouxii (kinetic only)
         mu_y = 0.022 * glc / (glc + 2.5) * max(0.0, 1 - xy / 3.5) if (xy > 0 and on) else 0.0
@@ -333,7 +344,6 @@ G = runs_wt["base"]["gthal"][-1]                  # g/L glucose consumed by WT T
 
 MULT_WT["umami"]  = ATTR["umami"]  * TYPICAL["umami"]  / G
 MULT_WT["kokumi"] = ATTR["kokumi"] * TYPICAL["kokumi"] / G
-# extra glutathione = (fold - 1) x WT kokumi term  ->  FRAC_GSH (mmol GSH per mmol glucose)
 FRAC_GSH_SET = {k: (f - 1.0) * MULT_WT["kokumi"] * G_GLC / G_GSH for k, f in KOKUMI_FOLDS.items()}
 frac_txt = {k: float(f"{v:.2e}") for k, v in FRAC_GSH_SET.items()}
 print(f"Glucose used by WT T. halophilus: {G:.1f} g/L | WT multipliers: umami={MULT_WT['umami']:.4f}, "
@@ -430,7 +440,8 @@ axT.set_ylabel("Temperature (C)"); axT.set_ylim(20, 35); axT.legend(loc="lower r
 
 # 4. pediocin
 for v, H in (("wt", WT), ("mut", MUT)):
-    ax[3].plot(dd, np.array(H["ped"])[msk], color="magenta", label=f"pediocin {v}", **sty[v])
+    ax[3].plot(dd, np.array(H["ped"])[msk], color="magenta",
+               label="pediocin WT (ATCC 8042, none)" if v == "wt" else "pediocin engineered (pedABCD)", **sty[v])
 
 titles = ["Biomass (g/L)", "Flavor indices relative to WT", "Broth pH", "Pediocin (mg/L)"]
 markers = [(0.0, "maroon"), (PEDIO_DAY - t0, "purple"), (YEAST_DAY - t0, "tab:blue")]
