@@ -25,22 +25,27 @@ WV_STD_SET = {"base": YEAST_DAY}
 INOC_THAL  = 0.100    # g/L DCW, T. halophilus (WT and engineered)
 INOC_PEDIO = 0.025    # g/L DCW, P. acidilactici
 INOC_YEAST = 0.015    # g/L DCW, Z. rouxii
-INOC_WV    = 0.015    # g/L DCW, W. versatilis (same as Z. rouxii)
+INOC_WV    = 0.015    # g/L DCW, W. versatilis
 
 T_START, T_END = 30.0, 25.0   # 30 C until Z. rouxii, then linear fall to 25 C at the end
 
 G_GLC, G_ACID, G_GSH, G_PED = 0.18016, 0.09008, 0.3073, 4.624   # g/mmol
-Q_THAL, Q_PEDIO = 0.64, 1.5      # glucose uptake caps at 30 C, mmol/gDW/h 
+Q_THAL, Q_PEDIO = 0.64, 1.5      # glucose uptake caps at 30 C, mmol/gDW/h (carried over from first script)
 # Pediocin: WT P. acidilactici ATCC 8042 is NOT a pediocin producer, so WT = 0.
 # The engineered strain carries the heterologous pedABCD operon from strain PAC1.0 (plasmid-borne in PAC1.0).
 # 1e-5 mmol pediocin per mmol glucose is ASSUMED to match the ~5 mg/L reported for producer strains in lab media;
+# expression in ATCC 8042 has not been measured (depends on promoter and copy number).
 FRAC_PED = {"wt": 0.0, "mut": 1e-5}
-PED_LEADER_ATP = 72     # ATP for the ~18-aa leader peptide that is made and cleaved off
-PED_EXPORT_ATP = 2      # ATP for export by the PedD ABC transporter
+PED_LEADER_ATP = 72     # ATP for the ~18-aa leader peptide that is made and cleaved off (4 ATP/aa; ASSUMED, verify vs UniProt)
+PED_EXPORT_ATP = 2      # ATP for export by the PedD ABC transporter (ASSUMED)
+
+# pH gate on pediocin production.
+PED_GATE_ON    = True   
+PED_PH_FULL, PED_PH_OFF, PED_GATE_FLOOR = 5.0, 5.5, 0.05
 ARG0_mM  = 5.0                   # ASSUMED free arginine
 MW_CITR  = 175.19
 
-# ---- Flavour scenarios (folds are plausibility ranges from the literature, not predictions) ----
+# ---- Flavour scenarios  ----
 # Literature scale (g/L) and assumed share made by T. halophilus
 TYPICAL = dict(umami=10.0, kokumi=0.10)   # free glutamate ~10 g/L (low end of 8-39); sum of gamma-Glu peptides median ~0.1 g/L (0.02-0.62)
 ATTR    = dict(umami=0.10, kokumi=0.10)   # ASSUMED: share attributable to T. halophilus
@@ -68,7 +73,7 @@ PH_STOP_THAL, PH_STOP_PEDIO = 4.3, 4.2
 PH_FREE = 5.2
 
 PARAMS = {
-    "wt": dict(ph_floor=0.02, p_ph_floor=0.02, ped_Ki=0.002, thal_decay=1.0e-4,   # ped_Ki unused for WT 
+    "wt": dict(ph_floor=0.02, p_ph_floor=0.02, ped_Ki=0.002, thal_decay=1.0e-4,   # ped_Ki unused for WT (no pediocin)
                p_decay=(0.0045, 0.0085), salt=0.3, adi_k=0.1),
     "mut": dict(ph_floor=0.05, p_ph_floor=0.10, ped_Ki=0.2, thal_decay=5.0e-5,
                 p_decay=(0.0005, 0.0012), salt=0.7, adi_k=0.0),     # arcA knockout
@@ -87,6 +92,13 @@ def lerp(pair, c):
 
 def ph_factor(pH, floor, stop, free=PH_FREE):
     return 1.0 if pH > free else max(floor, (pH - stop) / (free - stop))
+
+def ped_gate(pH):
+    if not PED_GATE_ON or pH <= PED_PH_FULL:
+        return 1.0
+    if pH >= PED_PH_OFF:
+        return PED_GATE_FLOOR
+    return 1.0 - (1.0 - PED_GATE_FLOOR) * (pH - PED_PH_FULL) / (PED_PH_OFF - PED_PH_FULL)
 
 # =====================================================================
 # MODEL BUILDING
@@ -133,20 +145,24 @@ def build_pedio(frac_ped, adi_ko):
         force_demand(m, "pedioc_c", frac_ped)
     return m
 
-_models = {
-    "thal_wt":   build_thal(0.0),
-    "pedio_wt":  build_pedio(FRAC_PED["wt"], adi_ko=False),
-    "pedio_mut": build_pedio(FRAC_PED["mut"], adi_ko=True),
+_BUILDERS = {
+    "thal_wt":   lambda: build_thal(0.0),
+    "pedio_wt":  lambda: build_pedio(FRAC_PED["wt"], adi_ko=False),
+    "pedio_mut": lambda: build_pedio(FRAC_PED["mut"], adi_ko=True),
 }
+_models = {}
 
 def get_model(key):
-    """thal_mut models are built on demand, one per FRAC_GSH value (key 'thal_mut@0.006')."""
+    """Models are built on demand (thal_mut models: one per FRAC_GSH value, key 'thal_mut@0.006')."""
     if key not in _models:
-        base, _, arg = key.partition("@")
-        if base == "thal_mut":
-            _models[key] = build_thal(float(arg))
+        if key in _BUILDERS:
+            _models[key] = _BUILDERS[key]()
         else:
-            raise KeyError(key)
+            base, _, arg = key.partition("@")
+            if base == "thal_mut":
+                _models[key] = build_thal(float(arg))
+            else:
+                raise KeyError(key)
     return _models[key]
 
 _cache = {}
@@ -194,8 +210,6 @@ def sanity():
 
 # =====================================================================
 # SIMULATION
-#   v = "wt":  W. versatilis added at the standard day (with Z. rouxii)
-#   v = "mut": W. versatilis added with T. halophilus
 # =====================================================================
 def simulate(v, frac_gsh=None, wv_std=None):
     P = PARAMS[v]
@@ -288,7 +302,7 @@ def simulate(v, frac_gsh=None, wv_std=None):
         lac += dl_t + dl_p
         lac_t_tot += dl_t; lac_p_tot += dl_p
         degr = lerp(T_PED_DEGR, c)
-        ped = max(0.0, ped + ped_p * x2 * DT * f * G_PED - degr * ped * DT)
+        ped = max(0.0, ped + ped_p * ped_gate(pH) * x2 * DT * f * G_PED - degr * ped * DT)
         gthal += glc_t * x1 * DT * f * G_GLC                       # g/L glucose used by thal
         gsh   += gsh_t * x1 * DT * f * G_GSH                       # g/L glutathione (FBA flux)
 
@@ -336,125 +350,128 @@ def flavour(H, v, umami_fold=1.0):
     me = MULT_WT["meaty"] * (MEATY_FOLD if v == "mut" else 1.0) * g
     return um, ko, me
 
-# =====================================================================
-# RUNS: WT first (to calibrate the multipliers), then the engineered runs
-# =====================================================================
-runs_wt = {k: simulate("wt", wv_std=d) for k, d in WV_STD_SET.items()}
-G = runs_wt["base"]["gthal"][-1]                  # g/L glucose consumed by WT T. halophilus
+FRAC_GSH_SET = {}
 
-MULT_WT["umami"]  = ATTR["umami"]  * TYPICAL["umami"]  / G
-MULT_WT["kokumi"] = ATTR["kokumi"] * TYPICAL["kokumi"] / G
-FRAC_GSH_SET = {k: (f - 1.0) * MULT_WT["kokumi"] * G_GLC / G_GSH for k, f in KOKUMI_FOLDS.items()}
-frac_txt = {k: float(f"{v:.2e}") for k, v in FRAC_GSH_SET.items()}
-print(f"Glucose used by WT T. halophilus: {G:.1f} g/L | WT multipliers: umami={MULT_WT['umami']:.4f}, "
-      f"kokumi={MULT_WT['kokumi']:.2e} | FRAC_GSH={frac_txt}")
+if __name__ == "__main__":
+    # =====================================================================
+    # RUNS: WT first (to calibrate the multipliers), then the engineered runs
+    # =====================================================================
+    runs_wt = {k: simulate("wt", wv_std=d) for k, d in WV_STD_SET.items()}
+    G = runs_wt["base"]["gthal"][-1]                  # g/L glucose consumed by WT T. halophilus
 
-runs_mut = {k: simulate("mut", frac_gsh=f) for k, f in FRAC_GSH_SET.items()}
-sanity()
+    MULT_WT["umami"]  = ATTR["umami"]  * TYPICAL["umami"]  / G
+    MULT_WT["kokumi"] = ATTR["kokumi"] * TYPICAL["kokumi"] / G
+    FRAC_GSH_SET = {k: (f - 1.0) * MULT_WT["kokumi"] * G_GLC / G_GSH for k, f in KOKUMI_FOLDS.items()}
+    frac_txt = {k: float(f"{v:.2e}") for k, v in FRAC_GSH_SET.items()}
+    print(f"Glucose used by WT T. halophilus: {G:.1f} g/L | WT multipliers: umami={MULT_WT['umami']:.4f}, "
+          f"kokumi={MULT_WT['kokumi']:.2e} | FRAC_GSH={frac_txt}")
 
-WT, MUT = runs_wt["base"], runs_mut["base"]
+    runs_mut = {k: simulate("mut", frac_gsh=f) for k, f in FRAC_GSH_SET.items()}
+    sanity()
 
-# ---- indices relative to WT final (WT = 1) ----
-um_wt, ko_wt, me_wt = flavour(WT, "wt")
-um_mut = {k: flavour(MUT, "mut", umami_fold=f)[0] for k, f in UMAMI_FOLDS.items()}
-ko_runs = {k: flavour(H, "mut")[1] for k, H in runs_mut.items()}
-ko_mean = np.mean(list(ko_runs.values()), axis=0)             # mean over FRAC_GSH runs
-me_mut = flavour(MUT, "mut")[2]
-sm_mut = np.array(MUT["smoky"])
-sm_wt  = {k: np.array(H["smoky"]) for k, H in runs_wt.items()}
+    WT, MUT = runs_wt["base"], runs_mut["base"]
 
-def fin(a):
-    return max(float(a[-1]), 1e-12)
+    # ---- indices relative to WT final (WT = 1) ----
+    um_wt, ko_wt, me_wt = flavour(WT, "wt")
+    um_mut = {k: flavour(MUT, "mut", umami_fold=f)[0] for k, f in UMAMI_FOLDS.items()}
+    ko_runs = {k: flavour(H, "mut")[1] for k, H in runs_mut.items()}
+    ko_mean = np.mean(list(ko_runs.values()), axis=0)             # mean over FRAC_GSH runs
+    me_mut = flavour(MUT, "mut")[2]
+    sm_mut = np.array(MUT["smoky"])
+    sm_wt  = {k: np.array(H["smoky"]) for k, H in runs_wt.items()}
 
-print(f"\nSummary ({MOROMI_DAYS:.0f} d moromi, 10% NaCl)")
-for label, H in (("WT (W. versatilis at standard day)", WT), ("Engineered (base FRAC_GSH)", MUT)):
-    wvd = H["wv_day"]
-    print(f"  {label}: pH={H['pH'][-1]:.2f} lactate={H['lac'][-1]:.1f} g/L "
-          f"(thal {H['acid_thal']:.1f}, pedio {H['acid_pedio']:.2f}) | pH5 day={H['ph5_day']} | "
-          f"W.versatilis start={'none' if wvd is None else round(wvd, 1)} d, final {H['xw'][-1]:.2f} g/L | "
-          f"4-EG={H['eg'][-1]:.1f} 4-VG={H['vg'][-1]:.1f} mg/L, ferulic acid left={H['fa_left']:.1f} mg/L | "
-          f"peak pediocin={max(H['ped']):.1f} mg/L")
-print("\nIndices at the end, relative to WT final = 1:")
-print("  umami  :", {k: round(float(um_mut[k][-1] / fin(um_wt)), 2) for k in UMAMI_FOLDS})
-print("  kokumi :", {f"FRAC_GSH={FRAC_GSH_SET[k]:.2e}": round(float(a[-1] / fin(ko_wt)), 2) for k, a in ko_runs.items()},
-      "| mean =", round(float(ko_mean[-1] / fin(ko_wt)), 2))
-print("  meaty  :", round(float(me_mut[-1] / fin(me_wt)), 2), "(assumed fold)")
-print("  smoky  :", {f"WT std day {WV_STD_SET[k]:.0f}": round(float(sm_mut[-1] / fin(a)), 2) for k, a in sm_wt.items()})
+    def fin(a):
+        return max(float(a[-1]), 1e-12)
 
-# =====================================================================
-# PLOTS: day 0 = T. halophilus inoculation
-# =====================================================================
-t0 = LAB_DAY
-d = np.array(MUT["day"]) - t0
-msk = d >= 0
-dd = d[msk]
-nr = lambda a, ref: (np.asarray(a) / fin(ref))[msk]
+    print(f"\nSummary ({MOROMI_DAYS:.0f} d moromi, 10% NaCl)")
+    for label, H in (("WT (W. versatilis at standard day)", WT), ("Engineered (base FRAC_GSH)", MUT)):
+        wvd = H["wv_day"]
+        print(f"  {label}: pH={H['pH'][-1]:.2f} lactate={H['lac'][-1]:.1f} g/L "
+              f"(thal {H['acid_thal']:.1f}, pedio {H['acid_pedio']:.2f}) | pH5 day={H['ph5_day']} | "
+              f"W.versatilis start={'none' if wvd is None else round(wvd, 1)} d, final {H['xw'][-1]:.2f} g/L | "
+              f"4-EG={H['eg'][-1]:.1f} 4-VG={H['vg'][-1]:.1f} mg/L, ferulic acid left={H['fa_left']:.1f} mg/L | "
+              f"peak pediocin={max(H['ped']):.1f} mg/L")
+    print("\nIndices at the end, relative to WT final = 1:")
+    print("  umami  :", {k: round(float(um_mut[k][-1] / fin(um_wt)), 2) for k in UMAMI_FOLDS})
+    print("  kokumi :", {f"FRAC_GSH={FRAC_GSH_SET[k]:.2e}": round(float(a[-1] / fin(ko_wt)), 2) for k, a in ko_runs.items()},
+          "| mean =", round(float(ko_mean[-1] / fin(ko_wt)), 2))
+    print("  meaty  :", round(float(me_mut[-1] / fin(me_wt)), 2), "(assumed fold)")
+    print("  smoky  :", {f"WT std day {WV_STD_SET[k]:.0f}": round(float(sm_mut[-1] / fin(a)), 2) for k, a in sm_wt.items()})
 
-fig, ax = plt.subplots(2, 2, figsize=(15, 10)); ax = ax.flatten()
-sty = {"wt": dict(ls="--", lw=1.4), "mut": dict(ls="-", lw=2.4)}
+    # =====================================================================
+    # PLOTS: day 0 = T. halophilus inoculation
+    # =====================================================================
+    t0 = LAB_DAY
+    d = np.array(MUT["day"]) - t0
+    msk = d >= 0
+    dd = d[msk]
+    nr = lambda a, ref: (np.asarray(a) / fin(ref))[msk]
 
-# 1. biomass (WT and engineered, base runs; Z. rouxii once)
-for v, H in (("wt", WT), ("mut", MUT)):
-    ax[0].plot(dd, np.array(H["x1"])[msk], color="green",  label=f"T. halophilus {v}",   **sty[v])
-    ax[0].plot(dd, np.array(H["x2"])[msk], color="purple", label=f"P. acidilactici {v}", **sty[v])
-ax[0].plot(dd, np.array(MUT["xy"])[msk], color="tab:blue", lw=2.0, label="Z. rouxii (unmodified)")
+    fig, ax = plt.subplots(2, 2, figsize=(15, 10)); ax = ax.flatten()
+    sty = {"wt": dict(ls="--", lw=1.4), "mut": dict(ls="-", lw=2.4)}
 
-# 2. flavour indices relative to WT final (WT = 1): base lines + shaded low-high ranges
-smoky_ref = sm_wt["base"]
-um_base = nr(um_mut["base"], um_wt)
-um_a, um_b = nr(um_mut["low"], um_wt), nr(um_mut["high"], um_wt)
-ko_base = nr(ko_runs["base"], ko_wt)
-ko_a, ko_b = nr(ko_runs["low"], ko_wt), nr(ko_runs["high"], ko_wt)
-um_lo, um_hi = np.minimum(um_a, um_b), np.maximum(um_a, um_b)
-ko_lo, ko_hi = np.minimum(ko_a, ko_b), np.maximum(ko_a, ko_b)
+    # 1. biomass (WT and engineered, base runs; Z. rouxii once)
+    for v, H in (("wt", WT), ("mut", MUT)):
+        ax[0].plot(dd, np.array(H["x1"])[msk], color="green",  label=f"T. halophilus {v}",   **sty[v])
+        ax[0].plot(dd, np.array(H["x2"])[msk], color="purple", label=f"P. acidilactici {v}", **sty[v])
+    ax[0].plot(dd, np.array(MUT["xy"])[msk], color="tab:blue", lw=2.0, label="Z. rouxii (unmodified)")
 
-# umami range, drawn in full (narrower band)
-ax[1].fill_between(dd, um_lo, um_hi, color="orange", alpha=0.30, lw=0, label="umami range")
+    # 2. flavour indices relative to WT final (WT = 1): base lines + shaded low-high ranges
+    smoky_ref = sm_wt["base"]
+    um_base = nr(um_mut["base"], um_wt)
+    um_a, um_b = nr(um_mut["low"], um_wt), nr(um_mut["high"], um_wt)
+    ko_base = nr(ko_runs["base"], ko_wt)
+    ko_a, ko_b = nr(ko_runs["low"], ko_wt), nr(ko_runs["high"], ko_wt)
+    um_lo, um_hi = np.minimum(um_a, um_b), np.maximum(um_a, um_b)
+    ko_lo, ko_hi = np.minimum(ko_a, ko_b), np.maximum(ko_a, ko_b)
 
-# kokumi range, only the parts outside the umami range
-up_lo = np.maximum(um_hi, ko_lo); up_hi = np.maximum(ko_hi, up_lo)      # above umami
-dn_hi = np.minimum(um_lo, ko_hi); dn_lo = np.minimum(ko_lo, dn_hi)      # below umami
-ax[1].fill_between(dd, up_lo, up_hi, color="chocolate", alpha=0.30, lw=0, label="kokumi range (beyond umami)")
-ax[1].fill_between(dd, dn_lo, dn_hi, color="chocolate", alpha=0.30, lw=0)
+    # umami range, drawn in full (narrower band)
+    ax[1].fill_between(dd, um_lo, um_hi, color="orange", alpha=0.30, lw=0, label="umami range")
 
-# lines on top
-ax[1].plot(dd, nr(um_wt, um_wt), color="orange", ls="--", lw=1.4, label="umami WT", zorder=3)
-ax[1].plot(dd, um_base, color="orange", lw=2.4, label="umami engineered (base)", zorder=3)
-ax[1].plot(dd, nr(ko_wt, ko_wt), color="chocolate", ls="--", lw=1.4, label="kokumi WT", zorder=3)
-ax[1].plot(dd, ko_base, color="chocolate", lw=2.4, label="kokumi engineered (base)", zorder=3)
-ax[1].plot(dd, nr(me_wt, me_wt), color="red", ls="--", lw=1.4, label="meaty WT", zorder=3)
-ax[1].plot(dd, nr(me_mut, me_wt), color="red", lw=2.4, label="meaty engineered", zorder=3)
-ax[1].plot(dd, nr(smoky_ref, smoky_ref), color="dimgray", ls="--", lw=1.4, label="smoky WT", zorder=3)
-ax[1].plot(dd, nr(sm_mut, smoky_ref), color="dimgray", lw=2.4, label="smoky engineered", zorder=3)
+    # kokumi range, only the parts outside the umami range
+    up_lo = np.maximum(um_hi, ko_lo); up_hi = np.maximum(ko_hi, up_lo)      # above umami
+    dn_hi = np.minimum(um_lo, ko_hi); dn_lo = np.minimum(ko_lo, dn_hi)      # below umami
+    ax[1].fill_between(dd, up_lo, up_hi, color="chocolate", alpha=0.30, lw=0, label="kokumi range (beyond umami)")
+    ax[1].fill_between(dd, dn_lo, dn_hi, color="chocolate", alpha=0.30, lw=0)
 
-tops = [um_hi.max(), ko_hi.max(), nr(me_mut, me_wt).max(), nr(sm_mut, smoky_ref).max(), 1.0]
-ax[1].set_ylabel("Index relative to WT")
-ax[1].set_ylim(0, 1.1 * max(tops))
+    # lines on top
+    ax[1].plot(dd, nr(um_wt, um_wt), color="orange", ls="--", lw=1.4, label="umami WT", zorder=3)
+    ax[1].plot(dd, um_base, color="orange", lw=2.4, label="umami engineered (base)", zorder=3)
+    ax[1].plot(dd, nr(ko_wt, ko_wt), color="chocolate", ls="--", lw=1.4, label="kokumi WT", zorder=3)
+    ax[1].plot(dd, ko_base, color="chocolate", lw=2.4, label="kokumi engineered (base)", zorder=3)
+    ax[1].plot(dd, nr(me_wt, me_wt), color="red", ls="--", lw=1.4, label="meaty WT", zorder=3)
+    ax[1].plot(dd, nr(me_mut, me_wt), color="red", lw=2.4, label="meaty engineered", zorder=3)
+    ax[1].plot(dd, nr(smoky_ref, smoky_ref), color="dimgray", ls="--", lw=1.4, label="smoky WT", zorder=3)
+    ax[1].plot(dd, nr(sm_mut, smoky_ref), color="dimgray", lw=2.4, label="smoky engineered", zorder=3)
 
-# 3. pH (engineered process)
-ax[2].plot(dd, np.array(MUT["pH"])[msk], color="red", lw=2.4, label="pH")
-ax[2].set_ylim(4.2, 6.7); ax[2].set_ylabel("pH")
-axT = ax[2].twinx()
-axT.plot(dd, np.array(MUT["T"])[msk], color="gray", lw=1.2, label="Temperature (C)")
-axT.set_ylabel("Temperature (C)"); axT.set_ylim(20, 35); axT.legend(loc="lower right", fontsize=7)
+    tops = [um_hi.max(), ko_hi.max(), nr(me_mut, me_wt).max(), nr(sm_mut, smoky_ref).max(), 1.0]
+    ax[1].set_ylabel("Index relative to WT")
+    ax[1].set_ylim(0, 1.1 * max(tops))
 
-# 4. pediocin
-for v, H in (("wt", WT), ("mut", MUT)):
-    ax[3].plot(dd, np.array(H["ped"])[msk], color="magenta",
-               label="pediocin WT (ATCC 8042, none)" if v == "wt" else "pediocin engineered (pedABCD)", **sty[v])
+    # 3. pH (engineered process)
+    ax[2].plot(dd, np.array(MUT["pH"])[msk], color="red", lw=2.4, label="pH")
+    ax[2].set_ylim(4.2, 6.7); ax[2].set_ylabel("pH")
+    axT = ax[2].twinx()
+    axT.plot(dd, np.array(MUT["T"])[msk], color="gray", lw=1.2, label="Temperature (C)")
+    axT.set_ylabel("Temperature (C)"); axT.set_ylim(20, 35); axT.legend(loc="lower right", fontsize=7)
 
-titles = ["Biomass (g/L)", "Flavor indices relative to WT", "Broth pH", "Pediocin (mg/L)"]
-markers = [(0.0, "maroon"), (PEDIO_DAY - t0, "purple"), (YEAST_DAY - t0, "tab:blue")]
-for a, t in zip(ax, titles):
-    a.set_title(t, fontweight="bold")
-    a.set_xlabel("Days after T. halophilus inoculation")
-    a.set_xlim(0, TOTAL_DAYS - t0)
-    a.grid(True, ls=":", alpha=0.6)
-    for x, col in markers:
-        a.axvline(x, color=col, ls=":", lw=1.2)
-    a.legend(fontsize=7, ncol=2)
+    # 4. pediocin
+    for v, H in (("wt", WT), ("mut", MUT)):
+        ax[3].plot(dd, np.array(H["ped"])[msk], color="magenta",
+                   label="pediocin WT (ATCC 8042, none)" if v == "wt" else "pediocin engineered (pedABCD)", **sty[v])
 
-plt.suptitle("10% NaCl Moromi model")
-plt.tight_layout()
-plt.savefig("moromi_wt_vs_mut_45_2.png", dpi=300, bbox_inches="tight")
-plt.show()
+    titles = ["Biomass (g/L)", "Flavor indices relative to WT", "Broth pH", "Pediocin (mg/L)"]
+    markers = [(0.0, "maroon"), (PEDIO_DAY - t0, "purple"), (YEAST_DAY - t0, "tab:blue")]
+    for a, t in zip(ax, titles):
+        a.set_title(t, fontweight="bold")
+        a.set_xlabel("Days after T. halophilus inoculation")
+        a.set_xlim(0, TOTAL_DAYS - t0)
+        a.grid(True, ls=":", alpha=0.6)
+        for x, col in markers:
+            a.axvline(x, color=col, ls=":", lw=1.2)
+        a.legend(fontsize=7, ncol=2)
+
+    plt.suptitle("10% NaCl Moromi model")
+    plt.tight_layout()
+    plt.savefig("moromi_wt_vs_mut_45_2.png", dpi=300, bbox_inches="tight")
+    plt.show()
